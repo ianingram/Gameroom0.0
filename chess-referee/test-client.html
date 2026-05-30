@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chess referee — test client</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 24px auto; padding: 0 16px; color: #1a1a1a; }
+  h1 { font-size: 18px; }
+  fieldset { border: 1px solid #ccc; border-radius: 8px; margin-bottom: 14px; padding: 12px 14px; }
+  legend { font-weight: bold; padding: 0 6px; }
+  label { display: inline-block; min-width: 70px; }
+  input { padding: 5px 7px; border: 1px solid #bbb; border-radius: 5px; font-size: 14px; }
+  button { padding: 6px 14px; border: 0; border-radius: 6px; background: #2b50aa; color: #fff; cursor: pointer; font-size: 14px; }
+  button:disabled { background: #aaa; cursor: not-allowed; }
+  #status { font-weight: bold; }
+  #color { padding: 2px 8px; border-radius: 5px; }
+  .w { background: #f4f1e8; color: #1a1a1a; border: 1px solid #999; }
+  .b { background: #1c1c20; color: #f4f1e8; }
+  #log { background: #f6f6f4; border: 1px solid #ddd; border-radius: 8px; padding: 10px; height: 260px; overflow: auto; font-family: ui-monospace, monospace; font-size: 12.5px; white-space: pre-wrap; }
+  .row { margin: 8px 0; }
+  .sent { color: #185fa5; }
+  .recv { color: #0f6e56; }
+  .sys  { color: #888; }
+  .err  { color: #a32d2d; }
+</style>
+</head>
+<body>
+<h1>Chess referee — test client</h1>
+<p style="color:#666;font-size:13px">Open this page in <b>two tabs</b>, connect both to the same room code, and exchange moves. The first tab to connect is White, the second is Black. Try moving out of turn — the referee should reject it.</p>
+
+<fieldset>
+  <legend>Connection</legend>
+  <div class="row">
+    <label>Server</label>
+    <input id="server" size="46" placeholder="wss://chess-referee.YOURNAME.workers.dev" value="ws://localhost:8787">
+  </div>
+  <div class="row">
+    <label>Room</label>
+    <input id="room" value="test1" size="14">
+    <label style="min-width:auto;margin-left:10px">Name</label>
+    <input id="name" value="player" size="12">
+    <button id="connectBtn">Connect</button>
+    <button id="disconnectBtn" disabled>Disconnect</button>
+  </div>
+  <div class="row">Status: <span id="status">disconnected</span> &nbsp; You are: <span id="color">—</span></div>
+</fieldset>
+
+<fieldset>
+  <legend>Make a move</legend>
+  <div class="row">
+    <label>From</label><input id="from" value="e2" size="6">
+    <label style="min-width:auto;margin-left:10px">To</label><input id="to" value="e4" size="6">
+    <button id="moveBtn" disabled>Send move</button>
+    <button id="resetBtn" disabled>Reset game</button>
+  </div>
+</fieldset>
+
+<fieldset>
+  <legend>Log</legend>
+  <div id="log"></div>
+</fieldset>
+
+<script>
+let ws = null;
+let myColor = null;
+let keepalive = null;
+
+const $ = (id) => document.getElementById(id);
+function log(msg, cls) {
+  const el = $("log");
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = new Date().toLocaleTimeString() + "  " + msg;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+
+function setColor(c) {
+  myColor = c;
+  const span = $("color");
+  if (c === "w") { span.textContent = "White"; span.className = "w"; }
+  else if (c === "b") { span.textContent = "Black"; span.className = "b"; }
+  else { span.textContent = c || "—"; span.className = ""; }
+}
+
+$("connectBtn").onclick = () => {
+  const base = $("server").value.replace(/\/+$/, "");
+  const room = encodeURIComponent($("room").value.trim() || "test1");
+  const name = encodeURIComponent($("name").value.trim() || "player");
+  const url = `${base}/room/${room}?name=${name}`;
+  log("connecting to " + url, "sys");
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    $("status").textContent = "connected";
+    $("connectBtn").disabled = true;
+    $("disconnectBtn").disabled = false;
+    $("moveBtn").disabled = false;
+    $("resetBtn").disabled = false;
+    // keepalive: bare "ping" gets an auto "pong" without waking the DO
+    keepalive = setInterval(() => { try { ws.send("ping"); } catch {} }, 30000);
+  };
+
+  ws.onmessage = (ev) => {
+    if (ev.data === "pong") return; // keepalive reply
+    let m; try { m = JSON.parse(ev.data); } catch { log("recv (raw): " + ev.data, "recv"); return; }
+    log("recv  " + JSON.stringify(m), "recv");
+    if (m.type === "welcome") setColor(m.color);
+    if (m.type === "full") log("** room is full — refused **", "err");
+    if (m.type === "start") log("** both players present — game on (turn: " + m.turn + ") **", "sys");
+    if (m.type === "waiting") log("** waiting for opponent to join **", "sys");
+    if (m.type === "state") log("** state sync: turn=" + m.turn + ", moves so far=" + m.moves.length + " **", "sys");
+    if (m.type === "move") log(">> OPPONENT moved " + m.from + " -> " + m.to + " (apply this on the board)", "recv");
+    if (m.type === "accepted") log("** your move accepted, next turn: " + m.turn + " **", "sys");
+    if (m.type === "reset") log("** game reset **", "sys");
+    if (m.type === "opponent_disconnected") log("** opponent (" + m.color + ") disconnected **", "err");
+    if (m.type === "error") log("** ERROR: " + m.reason + " **", "err");
+  };
+
+  ws.onclose = (ev) => {
+    $("status").textContent = "disconnected (" + ev.code + ")";
+    $("connectBtn").disabled = false;
+    $("disconnectBtn").disabled = true;
+    $("moveBtn").disabled = true;
+    $("resetBtn").disabled = true;
+    setColor(null);
+    if (keepalive) { clearInterval(keepalive); keepalive = null; }
+    log("connection closed", "sys");
+  };
+
+  ws.onerror = () => log("socket error (is the server URL right and running?)", "err");
+};
+
+$("disconnectBtn").onclick = () => { if (ws) ws.close(1000, "user"); };
+
+$("moveBtn").onclick = () => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const payload = { type: "move", from: $("from").value.trim(), to: $("to").value.trim() };
+  ws.send(JSON.stringify(payload));
+  log("sent  " + JSON.stringify(payload), "sent");
+};
+
+$("resetBtn").onclick = () => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type: "reset" }));
+  log("sent  reset", "sent");
+};
+</script>
+</body>
+</html>
