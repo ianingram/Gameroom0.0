@@ -1,0 +1,14 @@
+{
+  "name": "chess-referee",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Durable Object referee that relays chess moves between two players.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
