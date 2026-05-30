@@ -1,0 +1,295 @@
+{
+  "name": "chess-referee",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Durable Object referee that relays chess moves between two players.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
+
+# chess-referee
+
+A tiny Cloudflare **Worker + Durable Object** that relays chess moves between
+two players in real time over WebSockets. One Durable Object instance per room
+code; the object is the authoritative referee for whose turn it is.
+
+It does **not** know the rules of chess — your game client validates legality.
+The referee only: assigns colors, enforces turn order, relays each valid move
+to the opponent, and keeps an authoritative move log so a reconnecting player
+can resync.
+
+Built on the WebSocket **Hibernation API**, so while players think the object
+sleeps and you are not billed for idle time. On the Workers Free plan this is
+effectively free for personal use.
+
+---
+
+## Prerequisites
+
+- A Cloudflare account (you have one).
+- Node.js installed.
+- Wrangler (the Cloudflare CLI). `npm install` in this folder pulls it in, or
+  install the latest globally with `npm install -g wrangler@latest`.
+
+## Run locally
+
+```bash
+cd chess-referee
+npm install
+npx wrangler dev
+```
+
+Wrangler prints a local URL, usually `http://localhost:8787`. The WebSocket URL
+is the same host with `ws://`, e.g. `ws://localhost:8787`.
+
+Now open **`test-client.html`** in two browser tabs:
+
+1. Leave the server box as `ws://localhost:8787`, room `test1`, click **Connect**
+   in both tabs.
+2. The first tab becomes **White**, the second **Black**, and both log `start`.
+3. In the White tab, send a move (e.g. `e2` -> `e4`). The Black tab logs
+   `OPPONENT moved e2 -> e4`.
+4. Try sending a move from the **wrong** tab (White again, before Black replies).
+   The referee answers `ERROR: not_your_turn` — turn enforcement works.
+5. Close one tab; the other logs `opponent_disconnected`. Reopen and reconnect to
+   the same room; it receives a `state` sync with the moves so far.
+
+## Deploy
+
+```bash
+npx wrangler deploy
+```
+
+Wrangler gives you a public URL like
+`https://chess-referee.YOURNAME.workers.dev`. The WebSocket URL is the same with
+`wss://`, e.g. `wss://chess-referee.YOURNAME.workers.dev`. Put that into the test
+client's server box (from any device) to play across the internet.
+
+> First deploy will prompt you to log in (`wrangler login`) and may ask to
+> enable the Workers Free plan if you have not already.
+
+---
+
+## Message protocol (the contract the game client implements)
+
+Connect to: `wss://<host>/room/<code>?name=<player>`
+
+**Server → client**
+
+| type                    | fields                | meaning                                            |
+|-------------------------|-----------------------|----------------------------------------------------|
+| `welcome`               | `color`, `you`, `room`| your assigned color (`w` first, `b` second)        |
+| `state`                 | `turn`, `moves[]`     | full resync — replay `moves` from the start        |
+| `waiting`               | —                     | you are in; waiting for the second player          |
+| `start`                 | `turn`                | both players present, play may begin               |
+| `move`                  | `from`, `to`, `promotion`, `by` | opponent's move — apply it to your board |
+| `accepted`              | `turn`                | your move was accepted; it is now `turn`'s move    |
+| `reset`                 | `turn`                | game was reset — clear your board                  |
+| `opponent_disconnected` | `color`               | the other player dropped                           |
+| `full`                  | —                     | room already has two players (then closes)         |
+| `error`                 | `reason`              | `not_your_turn` / `not_a_player` / `waiting_for_opponent` |
+
+**Client → server**
+
+| type    | fields                      | meaning                          |
+|---------|-----------------------------|----------------------------------|
+| `move`  | `from`, `to`, `promotion?`  | you made this move locally       |
+| `reset` | —                           | start a new game                 |
+| `hello` | `name`                      | set/update your display name     |
+| `"ping"`| (bare string, not JSON)     | keepalive; auto-answered `pong`  |
+
+### How the game client will use this (next step)
+
+- On connect: store your `color`. On `state`, replay each move through the
+  game's existing move funnel `attemptMoveWithCaptures(from, to)` to catch up.
+- On `start`: enable the board (use the pass-and-play turn lock you already
+  built, keyed to your own color).
+- Local human move: apply it locally, then `ws.send({type:"move",from,to})`.
+- On `move` from the server: call `attemptMoveWithCaptures(from, to)` so the
+  opponent's move lands on your board.
+- Send a bare `"ping"` every ~30s to keep the connection warm.
+
+---
+
+## Notes / v1 limitations
+
+- Exactly two players per room; a third is refused with `full`.
+- The referee enforces *turn order*, not chess legality (the client does that).
+  A malicious client could send an illegal-but-in-turn move; for a friendly
+  two-player game that is fine. Server-side legality is a future hardening step.
+- Reconnect reclaims a freed color slot and resyncs via `state`. Mid-game
+  identity persistence (guaranteeing you get *your* color back) is a refinement.
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chess referee — test client</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 24px auto; padding: 0 16px; color: #1a1a1a; }
+  h1 { font-size: 18px; }
+  fieldset { border: 1px solid #ccc; border-radius: 8px; margin-bottom: 14px; padding: 12px 14px; }
+  legend { font-weight: bold; padding: 0 6px; }
+  label { display: inline-block; min-width: 70px; }
+  input { padding: 5px 7px; border: 1px solid #bbb; border-radius: 5px; font-size: 14px; }
+  button { padding: 6px 14px; border: 0; border-radius: 6px; background: #2b50aa; color: #fff; cursor: pointer; font-size: 14px; }
+  button:disabled { background: #aaa; cursor: not-allowed; }
+  #status { font-weight: bold; }
+  #color { padding: 2px 8px; border-radius: 5px; }
+  .w { background: #f4f1e8; color: #1a1a1a; border: 1px solid #999; }
+  .b { background: #1c1c20; color: #f4f1e8; }
+  #log { background: #f6f6f4; border: 1px solid #ddd; border-radius: 8px; padding: 10px; height: 260px; overflow: auto; font-family: ui-monospace, monospace; font-size: 12.5px; white-space: pre-wrap; }
+  .row { margin: 8px 0; }
+  .sent { color: #185fa5; }
+  .recv { color: #0f6e56; }
+  .sys  { color: #888; }
+  .err  { color: #a32d2d; }
+</style>
+</head>
+<body>
+<h1>Chess referee — test client</h1>
+<p style="color:#666;font-size:13px">Open this page in <b>two tabs</b>, connect both to the same room code, and exchange moves. The first tab to connect is White, the second is Black. Try moving out of turn — the referee should reject it.</p>
+
+<fieldset>
+  <legend>Connection</legend>
+  <div class="row">
+    <label>Server</label>
+    <input id="server" size="46" placeholder="wss://chess-referee.YOURNAME.workers.dev" value="ws://localhost:8787">
+  </div>
+  <div class="row">
+    <label>Room</label>
+    <input id="room" value="test1" size="14">
+    <label style="min-width:auto;margin-left:10px">Name</label>
+    <input id="name" value="player" size="12">
+    <button id="connectBtn">Connect</button>
+    <button id="disconnectBtn" disabled>Disconnect</button>
+  </div>
+  <div class="row">Status: <span id="status">disconnected</span> &nbsp; You are: <span id="color">—</span></div>
+</fieldset>
+
+<fieldset>
+  <legend>Make a move</legend>
+  <div class="row">
+    <label>From</label><input id="from" value="e2" size="6">
+    <label style="min-width:auto;margin-left:10px">To</label><input id="to" value="e4" size="6">
+    <button id="moveBtn" disabled>Send move</button>
+    <button id="resetBtn" disabled>Reset game</button>
+  </div>
+</fieldset>
+
+<fieldset>
+  <legend>Log</legend>
+  <div id="log"></div>
+</fieldset>
+
+<script>
+let ws = null;
+let myColor = null;
+let keepalive = null;
+
+const $ = (id) => document.getElementById(id);
+function log(msg, cls) {
+  const el = $("log");
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = new Date().toLocaleTimeString() + "  " + msg;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+
+function setColor(c) {
+  myColor = c;
+  const span = $("color");
+  if (c === "w") { span.textContent = "White"; span.className = "w"; }
+  else if (c === "b") { span.textContent = "Black"; span.className = "b"; }
+  else { span.textContent = c || "—"; span.className = ""; }
+}
+
+$("connectBtn").onclick = () => {
+  const base = $("server").value.replace(/\/+$/, "");
+  const room = encodeURIComponent($("room").value.trim() || "test1");
+  const name = encodeURIComponent($("name").value.trim() || "player");
+  const url = `${base}/room/${room}?name=${name}`;
+  log("connecting to " + url, "sys");
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    $("status").textContent = "connected";
+    $("connectBtn").disabled = true;
+    $("disconnectBtn").disabled = false;
+    $("moveBtn").disabled = false;
+    $("resetBtn").disabled = false;
+    // keepalive: bare "ping" gets an auto "pong" without waking the DO
+    keepalive = setInterval(() => { try { ws.send("ping"); } catch {} }, 30000);
+  };
+
+  ws.onmessage = (ev) => {
+    if (ev.data === "pong") return; // keepalive reply
+    let m; try { m = JSON.parse(ev.data); } catch { log("recv (raw): " + ev.data, "recv"); return; }
+    log("recv  " + JSON.stringify(m), "recv");
+    if (m.type === "welcome") setColor(m.color);
+    if (m.type === "full") log("** room is full — refused **", "err");
+    if (m.type === "start") log("** both players present — game on (turn: " + m.turn + ") **", "sys");
+    if (m.type === "waiting") log("** waiting for opponent to join **", "sys");
+    if (m.type === "state") log("** state sync: turn=" + m.turn + ", moves so far=" + m.moves.length + " **", "sys");
+    if (m.type === "move") log(">> OPPONENT moved " + m.from + " -> " + m.to + " (apply this on the board)", "recv");
+    if (m.type === "accepted") log("** your move accepted, next turn: " + m.turn + " **", "sys");
+    if (m.type === "reset") log("** game reset **", "sys");
+    if (m.type === "opponent_disconnected") log("** opponent (" + m.color + ") disconnected **", "err");
+    if (m.type === "error") log("** ERROR: " + m.reason + " **", "err");
+  };
+
+  ws.onclose = (ev) => {
+    $("status").textContent = "disconnected (" + ev.code + ")";
+    $("connectBtn").disabled = false;
+    $("disconnectBtn").disabled = true;
+    $("moveBtn").disabled = true;
+    $("resetBtn").disabled = true;
+    setColor(null);
+    if (keepalive) { clearInterval(keepalive); keepalive = null; }
+    log("connection closed", "sys");
+  };
+
+  ws.onerror = () => log("socket error (is the server URL right and running?)", "err");
+};
+
+$("disconnectBtn").onclick = () => { if (ws) ws.close(1000, "user"); };
+
+$("moveBtn").onclick = () => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const payload = { type: "move", from: $("from").value.trim(), to: $("to").value.trim() };
+  ws.send(JSON.stringify(payload));
+  log("sent  " + JSON.stringify(payload), "sent");
+};
+
+$("resetBtn").onclick = () => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type: "reset" }));
+  log("sent  reset", "sent");
+};
+</script>
+</body>
+</html>
+
+name = "chess-referee"
+main = "src/index.js"
+# Any date >= 2026-04-07 gets the runtime's auto-reply-to-close behavior.
+compatibility_date = "2026-05-01"
+
+# Bind the GameRoom Durable Object class so the Worker can reach it via env.GAME_ROOM.
+[[durable_objects.bindings]]
+name = "GAME_ROOM"
+class_name = "GameRoom"
+
+# SQLite-backed Durable Objects are REQUIRED on the Workers Free plan.
+# Use new_sqlite_classes (not new_classes) or deploy will be rejected on free.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["GameRoom"]
